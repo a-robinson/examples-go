@@ -35,12 +35,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/satori/go.uuid"
 	// Import postgres driver.
 	_ "github.com/lib/pq"
 )
 
 const (
+	blockID         = 12345
+	firstBlockStmts = `SELECT block_id FROM blocks WHERE block_id = $1`
+	updateBlockStmt = `UPDATE blocks SET (writer_id, block_num, raw_bytes) = ($2, $3, $4) WHERE block_id = $1`
 	insertBlockStmt = `INSERT INTO blocks (block_id, writer_id, block_num, raw_bytes) VALUES ($1, $2, $3, $4)`
 )
 
@@ -88,10 +92,9 @@ func (bw blockWriter) run(errCh chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for {
-		blockID := bw.rand.Int63()
 		blockData := bw.randomBlock()
 		bw.blockCount++
-		if _, err := bw.db.Exec(insertBlockStmt, blockID, bw.id, bw.blockCount, blockData); err != nil {
+		if _, err := bw.db.Exec(updateBlockStmt, blockID, bw.id, bw.blockCount, blockData); err != nil {
 			errCh <- fmt.Errorf("error running blockwriter %s: %s", bw.id, err)
 		} else {
 			v := atomic.AddUint64(&numBlocks, 1)
@@ -143,8 +146,25 @@ func setupDatabase(dbURL string) (*sql.DB, error) {
 	  writer_id STRING NOT NULL,
 	  block_num BIGINT NOT NULL,
 	  raw_bytes BYTES NOT NULL,
-	  PRIMARY KEY (block_id, writer_id, block_num)
+	  PRIMARY KEY (block_id)
 	)`); err != nil {
+		return nil, err
+	}
+
+	// Create the initial block.
+	if err := crdb.ExecuteTx(db, func(tx *sql.Tx) error {
+		rows, err := tx.Query(firstBlockStmts, blockID)
+		insertFirstRow := func() error {
+			_, err := db.Exec(insertBlockStmt, blockID, 0, 0, []byte{})
+			return err
+		}
+		if err != nil {
+			return err
+		} else if rows.Next() {
+			return nil
+		}
+		return insertFirstRow()
+	}); err != nil {
 		return nil, err
 	}
 
